@@ -1,39 +1,33 @@
 import React, { useState, useEffect, useRef } from 'react';
 
-// The WebSocket server URL
+// The WebSocket server URL remains the same
 const WEBSOCKET_URL = "ws://localhost:8000/tts-stream";
 
 function TtsPlayer() {
-  const [text, setText] = useState("Hello world! This is a real-time text to speech demo using React and FastAPI.");
+  const [text, setText] = useState();
   const [status, setStatus] = useState("Not Connected");
   const [audioUrl, setAudioUrl] = useState(null);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
+  
+  // 1. ADD STATE TO HOLD THE REFERENCE VOICE FILE
+  const [referenceFile, setReferenceFile] = useState(null);
 
-  // Use a ref to hold the WebSocket instance to avoid re-renders
   const socketRef = useRef(null);
 
-  // This useEffect hook handles the WebSocket connection lifecycle
   useEffect(() => {
-    // Connect to the WebSocket server
     socketRef.current = new WebSocket(WEBSOCKET_URL);
-    socketRef.current.binaryType = 'arraybuffer'; // We are expecting binary audio data
+    socketRef.current.binaryType = 'arraybuffer';
 
     socketRef.current.onopen = () => {
       console.log("WebSocket connection established.");
-      setStatus("Connected. Ready to synthesize.");
+      setStatus("Connected. Select a voice file and enter text.");
     };
 
     socketRef.current.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
         console.log(`Received audio data. Size: ${event.data.byteLength} bytes.`);
-        
-        // Create a Blob from the ArrayBuffer (which is like a file in memory)
         const audioBlob = new Blob([event.data], { type: 'audio/wav' });
-        
-        // Create a special URL that points to our in-memory Blob
         const url = URL.createObjectURL(audioBlob);
-        
-        // Update state to render the new audio player
         setAudioUrl(url);
         setStatus("Audio ready. Playing automatically.");
         setIsSynthesizing(false);
@@ -42,7 +36,7 @@ function TtsPlayer() {
 
     socketRef.current.onerror = (error) => {
       console.error("WebSocket Error:", error);
-      setStatus("Connection error. Check the console for details.");
+      setStatus("Connection error. Is the backend server running?");
       setIsSynthesizing(false);
     };
 
@@ -52,50 +46,93 @@ function TtsPlayer() {
       setIsSynthesizing(false);
     };
 
-    // Cleanup function: close the socket when the component unmounts
     return () => {
-      if (socketRef.current) {
-        socketRef.current.close();
-      }
+      if (socketRef.current) socketRef.current.close();
     };
-  }, []); // The empty dependency array ensures this effect runs only once on mount
+  }, []);
 
-  // This useEffect handles cleaning up the object URL to prevent memory leaks
   useEffect(() => {
     return () => {
-      if (audioUrl) {
-        console.log("Revoking old audio URL to free up memory:", audioUrl);
-        URL.revokeObjectURL(audioUrl);
-      }
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
     };
-  }, [audioUrl]); // This effect runs whenever the audioUrl changes
+  }, [audioUrl]);
 
-  const handleSynthesize = () => {
-    if (text && socketRef.current.readyState === WebSocket.OPEN) {
-      setIsSynthesizing(true);
-      setStatus("Synthesizing... please wait.");
-      setAudioUrl(null); // Clear previous audio player
-      socketRef.current.send(text);
-    } else {
-      setStatus("Cannot synthesize. Please enter text and ensure you are connected.");
+  // 2. HANDLER FOR THE FILE INPUT
+  const handleFileChange = (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      console.log("Reference voice file selected:", file.name);
+      setReferenceFile(file);
+      setStatus("Voice file selected. Ready to synthesize.");
     }
+  };
+
+  // 3. UPDATE THE SYNTHESIZE HANDLER
+  const handleSynthesize = () => {
+    // Check for all required conditions
+    if (!referenceFile) {
+        setStatus("Error: Please select a reference voice file (.wav or .mp3).");
+        return;
+    }
+    if (!text) {
+        setStatus("Error: Please enter some text to synthesize.");
+        return;
+    }
+    if (socketRef.current.readyState !== WebSocket.OPEN) {
+        setStatus("Error: Not connected to the server.");
+        return;
+    }
+
+    setIsSynthesizing(true);
+    setStatus("Uploading voice and synthesizing... please wait.");
+    setAudioUrl(null);
+
+    // 4. SEND DATA IN TWO PARTS: JSON FIRST, THEN BINARY FILE
+    // Part 1: Send metadata as a JSON string
+    const metadata = {
+        text: text,
+        language: "en" // You can make this dynamic if you add a language selector
+    };
+    socketRef.current.send(JSON.stringify(metadata));
+
+    // Part 2: Send the reference audio file as binary data
+    socketRef.current.send(referenceFile);
   };
 
   return (
     <div className="tts-player">
-      <h1>React & FastAPI TTS</h1>
+      <h1>Coqui TTS Voice Cloning</h1>
+      
+      {/* 5. ADD THE FILE INPUT ELEMENT */}
+      <div className="file-input-container">
+        <label htmlFor="voice-file">1. Select Reference Voice (.wav, .mp3)</label>
+        <input 
+          id="voice-file"
+          type="file" 
+          accept="audio/wav, audio/mpeg"
+          onChange={handleFileChange}
+          disabled={isSynthesizing}
+        />
+        {referenceFile && <div className="file-name">Selected: {referenceFile.name}</div>}
+      </div>
+
+      <label htmlFor="text-input">2. Enter Text to Synthesize</label>
       <textarea
+        id="text-input"
         value={text}
         onChange={(e) => setText(e.target.value)}
         placeholder="Enter text here..."
         disabled={isSynthesizing}
       />
-      <button onClick={handleSynthesize} disabled={isSynthesizing}>
-        {isSynthesizing ? "Working..." : "Synthesize Audio"}
+      
+      <button onClick={handleSynthesize} disabled={isSynthesizing || !referenceFile}>
+        {isSynthesizing ? "Working..." : "Clone Voice & Synthesize"}
       </button>
+
       <div className="status">
         <strong>Status:</strong> {status}
       </div>
+
       {audioUrl && (
         <div className="audio-container">
           <audio controls autoPlay src={audioUrl}>
