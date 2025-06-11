@@ -1,99 +1,97 @@
-# main.py
-import warnings
+# backend/main.py
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from TTS.api import TTS
+import warnings
 import torch
 import soundfile as sf
 import io
-import tempfile
 import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from TTS.api import TTS
 
-# --- Setup ---
-# Suppress a specific 'FutureWarning' from PyTorch to keep the console clean.
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# --- Model Loading ---
-print("Loading Coqui XTTS v2 model (this may take a few minutes on first run)...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# ‼️‼️ CRITICAL: MAKE SURE THIS PATH IS CORRECT ‼️‼️
+REFERENCE_VOICE_PATH = "my_voice.wav"
 
-# 1. CHANGE THE MODEL TO THE XTTS v2 MODEL FOR VOICE CLONING
+print("Loading Coqui XTTS v2 model...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 
-print("Coqui XTTS model loaded successfully.")
-# ---------------------
+if not os.path.exists(REFERENCE_VOICE_PATH):
+    print(f"FATAL ERROR: Reference voice file not found at '{REFERENCE_VOICE_PATH}'")
+    exit()
+else:
+    print(f"Using reference voice: {REFERENCE_VOICE_PATH}")
 
-# --- FastAPI App ---
 app = FastAPI()
 
-# Add CORS middleware to allow requests from your React frontend
-origins = [
-    "http://localhost",
-    "http://localhost:5173",  # Default Vite port
-    "http://localhost:3000",  # Default Create React App port
-]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],  
+    allow_credentials=True, 
+    allow_methods=["*"], 
     allow_headers=["*"],
 )
+
+
+async def ping_worker(websocket: WebSocket):
+    while True:
+        try:
+            await asyncio.sleep(15)
+            await websocket.send_json({"type": "ping"})
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            break
+
+async def tts_worker(websocket: WebSocket, queue: asyncio.Queue):
+    while True:
+        try:
+            text_to_speak = await queue.get()
+            print(f"Worker processing: '{text_to_speak[:30]}...' (This may take a while)")
+
+            
+            wav_samples = await asyncio.to_thread(
+                tts.tts,
+                text=text_to_speak,
+                speaker_wav=REFERENCE_VOICE_PATH,
+                language="en"
+            )
+            
+            
+            print("TTS synthesis finished. Sending audio data...")
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, wav_samples, 24000, format='WAV')
+            wav_bytes = wav_buffer.getvalue()
+
+            await websocket.send_bytes(wav_bytes)
+            print("Finished sending audio data.")
+            queue.task_done()
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            break
+        except Exception as e:
+            print(f"An error occurred in TTS worker: {e}")
+            
 
 @app.websocket("/tts-stream")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("WebSocket connection established.")
+    print("SERVER: WebSocket connection established.")
+    
+    queue = asyncio.Queue()
+    tts_task = asyncio.create_task(tts_worker(websocket, queue))
+    ping_task = asyncio.create_task(ping_worker(websocket))
 
     try:
         while True:
-            # 2. THE NEW PROTOCOL: RECEIVE JSON METADATA, THEN AUDIO BYTES
-            
-            # 3. First, expect a JSON message with text and language
-            metadata = await websocket.receive_json()
-            text = metadata.get("text")
-            language = metadata.get("language", "en") # Default to 'en' if not provided
-            print(f"Received text: '{text}' in language: '{language}'")
-
-            # 4. Second, expect the raw audio bytes for the reference voice
-            reference_audio_bytes = await websocket.receive_bytes()
-            print(f"Received reference audio file of size: {len(reference_audio_bytes)} bytes.")
-
-            # 5. Save the received audio to a temporary file
-            # Coqui's tts() function needs a file path for speaker_wav
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-                temp_audio_file.write(reference_audio_bytes)
-                temp_audio_path = temp_audio_file.name
-
-            try:
-                # 6. Synthesize the audio using the XTTS model and the reference voice
-                print(f"Cloning voice from temporary file: {temp_audio_path}")
-                wav_samples = tts.tts(
-                    text=text,
-                    speaker_wav=temp_audio_path,
-                    language=language
-                )
-
-                # 7. Convert the audio samples to WAV format bytes in memory
-                wav_buffer = io.BytesIO()
-                # XTTS default sample rate is 24000
-                sf.write(wav_buffer, wav_samples, 24000, format='WAV')
-                wav_bytes = wav_buffer.getvalue()
-
-                # 8. Send the entire synthesized audio clip back to the client
-                await websocket.send_bytes(wav_bytes)
-                print("Finished sending synthesized audio data.")
-
-            finally:
-                # 9. Clean up the temporary file
-                os.remove(temp_audio_path)
-                print(f"Cleaned up temporary file: {temp_audio_path}")
-
-
+            text = await websocket.receive_text()
+            print(f"SERVER: Received text, adding to queue: '{text}'")
+            await queue.put(text)
     except WebSocketDisconnect:
-        print("Client disconnected.")
-    except Exception as e:
-        print(f"An error occurred in the WebSocket: {e}")
+        print("SERVER: Client disconnected.")
     finally:
-        print("WebSocket connection closed.")
+        print("SERVER: Closing background tasks...")
+        tts_task.cancel()
+        ping_task.cancel()
+        await asyncio.gather(tts_task, ping_task, return_exceptions=True)
+        print("SERVER: Connection and tasks closed.")

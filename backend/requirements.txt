@@ -1,10 +1,8 @@
 fastapi
 uvicorn
-python-multipart
-websockets
-torch==2.5.1
-torchaudio==2.5.1
-torchvision==0.20.1
-transformers==4.39.3
 TTS
+torch
+torchaudio
+torchvision
 soundfile
+websockets
